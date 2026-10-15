@@ -209,9 +209,10 @@ class App(tk.Tk):
                     extra = sketchfab.facts(link)
                 except Exception as e:
                     extra = [("Data API", [("error", str(e))])]
-            found, records, decoders, apis, shot, secs = core.inspect(
+            found, records, decoders, apis, shot, secs, link = core.inspect_smart(
                 link, assisted=assisted, ready=self.ready_event, browser_name=browser_name,
-                on_waiting=lambda: self.after(0, self.waiting_for_user))
+                on_waiting=lambda: self.after(0, self.waiting_for_user),
+                on_status=lambda t: self.after(0, self.set_status, t, ACCENT))
             found["sketchfab"] = extra
             for sec, rows in extra or []:
                 for k, v in rows:
