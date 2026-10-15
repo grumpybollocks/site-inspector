@@ -42,7 +42,7 @@ buttons, canvas click), asks every frame which engine it runs, then writes
 
 **Gallery / index links:** if the pasted page shows no 3D, it opens the most model-like page linked from it
 on the same site (address words like model/object/3d/sample, or thumbnail links in a gallery grid) and analyses that,
-up to 2 tries. The report says which page it opened.
+up to 3 tries. The report says which page it opened.
 
 **Assisted mode** (tick "I'll open it myself", or `inspect_site.py --assisted <url>`): for sites with an
 "are you human" check. A visible Brave window opens with its own profile (`~/.cache/site-inspector-profile`,
