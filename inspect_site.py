@@ -91,7 +91,8 @@ DETECT_JS = r"""() => {
   const txt = (document.body && document.body.innerText || '').slice(0, 3000);
   const blocked = /access (is )?(temporarily )?(restricted|denied)|just a moment|verify you are human|unusual activity|captcha|are you a robot/i.test(document.title + ' ' + txt);
   // links on this site that look like a single model's page (used when this page itself shows no 3D)
-  const here = location.href.split('#')[0];
+  const norm = h => h.split('#')[0].replace(/\/+$/, '');
+  const here = norm(location.href);
   const site = location.hostname.replace(/^www\./, '');
   const want = /(model|3d|object|objekt|item|sample|viewer|detail|artifact|artefact|scan|asset|product|exhibit|specimen|example|showcase)/i;
   const skip = /(login|signin|sign-in|signup|register|cart|checkout|account|privacy|cookie|terms|contact|about|faq|help|blog|news|search|tags?\/|category|mailto:|javascript:|\.(pdf|zip|jpg|png)$)/i;
@@ -102,13 +103,13 @@ DETECT_JS = r"""() => {
   for (const a of document.querySelectorAll('a[href]')) {
     let u; try { u = new URL(a.href); } catch (e) { continue; }
     const href = u.href.split('#')[0];
-    if (!/^https?:/.test(u.protocol) || !u.hostname.endsWith(site) || href === here || seen.has(href)) continue;
+    if (!/^https?:/.test(u.protocol) || !u.hostname.endsWith(site) || norm(href) === here || seen.has(norm(href))) continue;
     if (skip.test(href) || home.test(u.pathname)) continue;
     const thumb = !!a.querySelector('img,picture,canvas,video') ||
                   /url\(/.test(getComputedStyle(a).backgroundImage || '');
     const keyword = want.test(u.pathname + u.search);
     if (!keyword && !thumb) continue;
-    seen.add(href);
+    seen.add(norm(href));
     const score = (keyword ? 3 : 0) + (thumb ? 2 : 0) + Math.min(u.pathname.split('/').filter(Boolean).length, 4) / 4;
     candidates.push({href, score});
   }
@@ -489,15 +490,17 @@ def shows_3d(found, records):
 
 def inspect_smart(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto", on_status=None):
     """inspect(), and if the pasted page is a gallery / index with no 3D on it, open the most
-    model-looking page linked from it on the same site and inspect that instead (up to 2 tries)."""
+    model-looking page linked from it on the same site and inspect that instead (up to 3 tries)."""
     result = inspect(url, assisted, ready, on_waiting, browser_name)
     found, records = result[0], result[1]
     if assisted or found.get("blocked") or found.get("direct_file") or shows_3d(found, records):
         return result + (url,)
-    for cand in (found.get("candidates") or [])[:2]:
+    same = lambda a, b: a.split("#")[0].rstrip("/") == b.split("#")[0].rstrip("/")
+    cands = [c for c in (found.get("candidates") or []) if not same(c, url)][:3]
+    for cand in cands:
         if on_status:
             on_status(f"No 3D on that page - it looks like a gallery. Trying a model page on the same site: {cand}"
-                      if cand == found["candidates"][0] else f"No 3D there either. Trying another one: {cand}")
+                      if cand == cands[0] else f"No 3D there either. Trying another one: {cand}")
         r2 = inspect(cand, False, None, None, browser_name)
         if shows_3d(r2[0], r2[1]):
             r2[0]["explored_from"] = url
