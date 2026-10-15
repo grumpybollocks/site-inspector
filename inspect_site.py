@@ -16,6 +16,7 @@ and model file links are shortened to host + format.
 
 Usage: inspect_site.py <url>     (prints "Report: <path>" at the end)
 """
+import json
 import re
 import sys
 import time
@@ -27,10 +28,11 @@ from urllib.parse import urlsplit, parse_qs
 from playwright.sync_api import sync_playwright
 
 BRAVE = "/usr/bin/brave"
+BROWSERS = ["Auto", "Brave", "Chromium", "Firefox"]   # Chromium/Firefox = Playwright's own builds
 REPORTS = Path(__file__).resolve().parent / "reports"
 WAIT_AFTER_LOAD = 10  # seconds for viewers that load the model after the page
 
-MODEL_EXT = {"glb": "glTF binary", "gltf": "glTF JSON", "bin": "glTF buffer", "drc": "Draco mesh",
+MODEL_EXT = {"glb": "glTF binary", "gltf": "glTF JSON", "bin": "binary buffer (.bin, usually glTF)", "drc": "Draco mesh",
              "obj": "Wavefront OBJ", "stl": "STL", "fbx": "FBX", "ply": "PLY", "3mf": "3MF",
              "usdz": "USDZ (Apple AR)", "usd": "USD", "splat": "Gaussian splat", "spz": "Gaussian splat",
              "ksplat": "Gaussian splat", "3dm": "Rhino", "dae": "Collada", "vox": "VOX",
@@ -76,9 +78,12 @@ DETECT_JS = r"""() => {
   const frames = [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean);
   const embeds = frames.filter(s => /sketchfab|p3d\.in|vectary|spline\.design|clara\.io|myminifactory|3dviewer|matterport|kuula|3dvista|shapespark|marmoset|verge3d|needle\.tools|playcanv\.as|babylonjs|modelviewer|threedium|emersya|cappasity/i.test(s))
                        .map(s => new URL(s).host);
+  // read the context type the GPU probe recorded - never call getContext() here, that would
+  // create a brand-new context on unused canvases and distort the numbers
   let gl = 0, gl2 = 0;
   for (const c of document.querySelectorAll('canvas')) {
-    if (c.getContext('webgl2')) gl2++; else if (c.getContext('webgl')) gl++;
+    const t = c.__siCtx || '';
+    if (t === 'webgl2') gl2++; else if (/webgl/.test(t)) gl++;
   }
   const scripts = [...document.scripts].map(s => s.src).filter(Boolean)
      .filter(s => /three|babylon|model-viewer|playcanvas|cesium|draco|meshopt|unity|splat|viewer|webgl/i.test(s))
@@ -172,7 +177,7 @@ GPU_PROBE_JS = r"""(() => {
   const gc = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, ...a) {
     const c = gc.call(this, type, ...a);
-    if (c && /webgl|webgpu/i.test(type)) S.ctx[type] = (S.ctx[type] || 0) + 1;
+    if (c && /webgl|webgpu/i.test(type) && !this.__siCtx) { this.__siCtx = type; S.ctx[type] = (S.ctx[type] || 0) + 1; }
     return c;
   };
   if (window.OffscreenCanvas) {
@@ -254,7 +259,9 @@ def gpu_stats(page):
     b = total()
     frames = b["frames"] - a["frames"]
     b["fps"] = round(frames / 2)
-    b["draws_per_frame"] = round((b["draws"] - a["draws"]) / frames) if frames else 0
+    # no frames seen = rendering off the main thread (worker / OffscreenCanvas / XR): per-frame unknown
+    b["draws_per_frame"] = round((b["draws"] - a["draws"]) / frames) if frames else None
+    b["frames"] = frames
     return b
 
 
@@ -305,24 +312,42 @@ SOFT_ARGS = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore
 ASSISTED_PROFILE = Path.home() / ".cache" / "site-inspector-profile"
 
 
-def inspect(url, assisted=False, ready=None, on_waiting=None):
+def open_browser(p, which, assisted):
+    """Returns (browser or None, context, name used). 'Auto' = Brave if installed, else Playwright Chromium."""
+    which = (which or "Auto").capitalize()
+    if which == "Auto":
+        which = "Brave" if Path(BRAVE).exists() else "Chromium"
+    if which == "Firefox":
+        kind, opts = p.firefox, {}
+    else:
+        kind = p.chromium
+        opts = {"executable_path": BRAVE} if which == "Brave" else {}
+    if assisted:   # visible window, own profile per browser (never the user's real profile)
+        prof = ASSISTED_PROFILE / which.lower()
+        prof.mkdir(parents=True, exist_ok=True)
+        extra = {} if which == "Firefox" else {"args": GPU_ARGS}
+        return None, kind.launch_persistent_context(str(prof), headless=False, no_viewport=True, **opts, **extra), which
+    # Real GPU first: sites like Sketchfab test the browser and serve a still image
+    # instead of live 3D when they only get software rendering.
+    if which == "Firefox":
+        browser = kind.launch(headless=True)
+    else:
+        try:
+            browser = kind.launch(headless=True, args=GPU_ARGS, **opts)
+        except Exception:
+            browser = kind.launch(headless=True, args=SOFT_ARGS, **opts)
+    return browser, browser.new_context(viewport={"width": 1400, "height": 900}), which
+
+
+def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto"):
     """assisted=True: open a VISIBLE browser, the user browses / passes any human check
     themselves, and the analysis starts when `ready` (threading.Event) is set."""
     records, decoders, apis, images = [], {}, {}, []
+    seen = set()
     url = sketchfab_embed(url)
     with sync_playwright() as p:
-        browser = None
-        if assisted:
-            ctx = p.chromium.launch_persistent_context(str(ASSISTED_PROFILE), executable_path=BRAVE,
-                                                       headless=False, no_viewport=True, args=GPU_ARGS)
-        else:
-            # Real GPU first: sites like Sketchfab test the browser and serve a still image
-            # instead of live 3D when they only get software rendering.
-            try:
-                browser = p.chromium.launch(executable_path=BRAVE, headless=True, args=GPU_ARGS)
-            except Exception:
-                browser = p.chromium.launch(executable_path=BRAVE, headless=True, args=SOFT_ARGS)
-            ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+        t0 = time.time()
+        browser, ctx, used = open_browser(p, browser_name, assisted)
         ctx.add_init_script(GPU_PROBE_JS)   # catch-all GPU probe, injected into every frame of every tab
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         wasm = {}
@@ -346,6 +371,9 @@ def inspect(url, assisted=False, ready=None, on_waiting=None):
                 if kind == "decoder":
                     decoders[label] = urlsplit(resp.url).netloc
                     return
+                if resp.url in seen:      # the same file requested twice = one file
+                    return
+                seen.add(resp.url)
                 if kind == "api":
                     if req.resource_type in ("fetch", "xhr"):
                         apis.setdefault(api_pattern(resp.url), resp.status)
@@ -364,12 +392,12 @@ def inspect(url, assisted=False, ready=None, on_waiting=None):
                     "auth": ("Authorization header" if "authorization" in rh else
                              "cookies" if "cookie" in rh else "none"),
                     "via": req.resource_type,
+                    "t": round(time.time() - t0, 2),   # seconds after start, for the load timeline
                 })
             except Exception:
                 pass
 
         ctx.on("response", on_response)   # all tabs, so it also follows wherever the user clicks
-        t0 = time.time()
         try:
             page.goto(url, wait_until="load", timeout=60000)
         except Exception as e:
@@ -377,9 +405,19 @@ def inspect(url, assisted=False, ready=None, on_waiting=None):
         if assisted:
             if on_waiting:
                 on_waiting()
-            if ready:
-                ready.wait(timeout=1800)       # the user says "page is ready" (max 30 min)
-            page = ctx.pages[-1] if ctx.pages else page   # analyse the tab they ended on
+            closed = False
+            for _ in range(1800):              # the user says "page is ready" (max 30 min)
+                if ready is None or ready.wait(timeout=1):
+                    break
+                if not ctx.pages:              # user closed the browser window instead
+                    closed = True
+                    break
+            if closed:
+                ctx.close()
+                if browser:
+                    browser.close()
+                raise RuntimeError("The browser window was closed before “Page is ready” was pressed.")
+            page = ctx.pages[-1]               # analyse the tab they ended on
             page.wait_for_timeout(3000)
         else:
             page.wait_for_timeout(WAIT_AFTER_LOAD * 1000)
@@ -401,6 +439,7 @@ def inspect(url, assisted=False, ready=None, on_waiting=None):
         except Exception:
             found["gpu"] = None
         found["wasm"] = wasm
+        found["browser"] = used + (" (visible, assisted)" if assisted else " (hidden)")
         shot = REPORTS / f"shot-{int(t0)}.png"
         REPORTS.mkdir(exist_ok=True)
         try:
@@ -472,11 +511,12 @@ def summary(found, records, decoders):
     g = found.get("gpu")
     if gpu_active(found):
         api = "WebGPU" if g["webgpuDevice"] else "WebGL"
+        per_frame = (f"~{g['draws_per_frame']} draw calls per frame at ~{g['fps']} fps" if g.get("frames")
+                     else "rendering runs off the main thread (worker/OffscreenCanvas), so per-frame numbers are not visible")
         lines.append(f"GPU catch-all ({api}): {g['buffers']} geometry/data buffers ({human(g['bufferBytes'])}) and "
-                     f"{g['textures']} textures uploaded, {g['programs']} shader programs/pipelines, "
-                     f"~{g['draws_per_frame']} draw calls per frame at ~{g['fps']} fps"
+                     f"{g['textures']} textures uploaded, {g['programs']} shader programs/pipelines, " + per_frame
                      + (f", {g['instanced']} instanced draws (GPU instancing)" if g["instanced"] else "") + ".")
-        if g["draws"] and not g["draws_per_frame"]:
+        if g["draws"] and g.get("frames") and not g["draws_per_frame"]:
             lines.append("It renders on demand: the scene is redrawn only when the view changes, not every frame "
                          "(saves battery and GPU while the model sits still).")
     if found.get("wasm"):
@@ -494,7 +534,8 @@ def gpu_table(found):
             ("WebGPU", "device created" if g["webgpuDevice"] else "adapter requested only" if g["webgpu"] else "not used"),
             ("Geometry / data buffers uploaded", f"{g['buffers']:,}  ({human(g['bufferBytes'])})"),
             ("Textures uploaded", f"{g['textures']:,}"), ("Shader programs linked", f"{g['programs']:,}"),
-            ("Draw calls per frame", f"~{g['draws_per_frame']:,}  (instanced draws total: {g['instanced']:,})"),
+            ("Draw calls per frame", (f"~{g['draws_per_frame']:,}" if g.get("frames") else "n/a (renders off the main thread)")
+             + f"  (instanced draws total: {g['instanced']:,})"),
             ("Frame rate while inspected", f"~{g['fps']} fps"),
             ("WebAssembly modules", f"{g['wasm']} instantiated · files: " + (", ".join(found.get('wasm') or {}) or "none")),
             ("Web workers started", f"{g['workers']}")]
@@ -514,6 +555,18 @@ def report(url, found, records, decoders, apis, shot, secs, extra=None):
         f"<td>{escape(r['signed'])}</td><td>{escape(r['auth'])}</td><td>{escape(r['cors'])}</td>"
         f"<td>{escape(r['cache'])}</td><td>{escape(r['via'])}</td></tr>" for r in records)
     li = lambda xs: "".join(f"<li>{escape(x)}</li>" for x in xs) or "<li>none found</li>"
+    import extras
+    sum_lines = summary(found, records, decoders)
+    score, tips = extras.lessons(found, records, decoders)
+    icon = {"ok": "✅", "tip": "💡", "info": "ℹ️"}
+    lessons_html = (f"<p style='font-size:18px'>Score: <b style='color:#c8b089'>{score}/100</b> "
+                    f"<span class='muted'>(how many good practices this site uses)</span></p>" if score is not None else "") + \
+        "<table>" + "".join(f"<tr><th style='width:280px'>{icon[st]} {escape(t)}</th><td>{escape(d)}</td></tr>"
+                            for st, t, d in tips) + "</table>"
+    text_for_terms = " ".join(sum_lines) + " " + " ".join(f"{r['format']} {r['cdn']} {r['signed']} {r['cors']}" for r in records) \
+        + " " + " ".join(decoders) + " " + " ".join(found.get("libs", {})) + (" API" if apis else "") + " draw call shader"
+    gloss_html = "<table>" + "".join(f"<tr><th style='width:220px'>{escape(t)}</th><td>{escape(e)}</td></tr>"
+                                     for t, e in extras.glossary(text_for_terms)) + "</table>"
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Inspector – {escape(host)}</title>
 <style>body{{font-family:system-ui;background:#14171c;color:#e8e6e1;margin:24px;max-width:1300px}}
 h1{{font-size:22px}} h2{{font-size:16px;color:#c8b089;margin-top:28px}} code{{color:#9fd3ff}}
@@ -522,7 +575,10 @@ th{{background:#1e2229}} .sum li{{margin:6px 0;font-size:15px}} img{{max-width:1
 .muted{{color:#9aa0a8;font-size:13px}}</style></head><body>
 <h1>How <code>{escape(host)}</code> delivers its 3D model</h1>
 <p class="muted">{escape(found.get('title',''))} · inspected {datetime.now():%Y-%m-%d %H:%M} in {secs:.0f}s · {escape(url)}</p>
-<h2>Summary</h2><ul class="sum">{li(summary(found, records, decoders))}</ul>
+<p class="muted">Browser used: {escape(found.get('browser', '?'))}</p>
+<h2>Architecture at a glance</h2>{extras.diagram_svg(found, records, decoders, apis)}
+<h2>Summary</h2><ul class="sum">{li(sum_lines)}</ul>
+<h2>Lessons for your own site</h2>{lessons_html}
 {extra_html}
 <h2>1 · How it is made visible (client side)</h2>
 <ul>{li([f"{k}: {v}" for k, v in found['libs'].items()])}</ul>
@@ -533,31 +589,37 @@ th{{background:#1e2229}} .sum li{{margin:6px 0;font-size:15px}} img{{max-width:1
 <th>Signed link</th><th>Login sent</th><th>CORS</th><th>Caching</th><th>Loaded via</th></tr>{rows or '<tr><td colspan=11>No 3D files or textures seen</td></tr>'}</table>
 <h2>Catch-all · what the GPU received (works for any engine)</h2>
 {gpu_table(found)}
+<h2>Load timeline</h2>{extras.timeline_html(records)}
 <h2>3 · Compression decoders</h2><ul>{li([f"{k} (from {v})" for k, v in decoders.items()])}</ul>
 <h2>4 · API calls feeding the page (catalogue / metadata)</h2><ul>{li([f"{k}  → HTTP {v}" for k, v in list(apis.items())[:30]])}</ul>
+<h2>Glossary (terms used in this report)</h2>{gloss_html}
 <h2>What the page looked like</h2>{f'<img src="{shot.name}">' if shot else '<p>no screenshot</p>'}
 <p class="muted">Architecture report only: file contents are not read or saved, and file links are shortened to host + format.</p>
 </body></html>"""
     REPORTS.mkdir(exist_ok=True)
     out = REPORTS / f"{re.sub(r'[^a-zA-Z0-9.]+', '_', host)}-{datetime.now():%Y%m%d-%H%M%S}.html"
     out.write_text(html, encoding="utf-8")
+    # flat facts for the History list and Compare
+    out.with_suffix(".json").write_text(
+        json.dumps(extras.run_summary(url, host, found, records, decoders, apis, score, out), indent=2), encoding="utf-8")
     return out
 
 
 if __name__ == "__main__":
     assisted = "--assisted" in sys.argv[1:]
-    args = [a for a in sys.argv[1:] if a != "--assisted"]
+    bname = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--browser=")), "Auto")
+    args = [a for a in sys.argv[1:] if a != "--assisted" and not a.startswith("--browser=")]
     if len(args) != 1 or not args[0].startswith(("http://", "https://")):
-        sys.exit("Usage: inspect_site.py [--assisted] <http(s) link>")
+        sys.exit("Usage: inspect_site.py [--assisted] [--browser=Auto|Brave|Chromium|Firefox] <http(s) link>")
     sys.argv[1:] = args
     if assisted:
         import threading
         ev = threading.Event()
         found, records, decoders, apis, shot, secs = inspect(
-            args[0], assisted=True, ready=ev,
+            args[0], assisted=True, ready=ev, browser_name=bname,
             on_waiting=lambda: (input("Browse / pass any check in the window, then press Enter here... "), ev.set()))
     else:
-        found, records, decoders, apis, shot, secs = inspect(args[0])
+        found, records, decoders, apis, shot, secs = inspect(args[0], browser_name=bname)
     for line in summary(found, records, decoders):
         print(line)
     extra = None

@@ -34,7 +34,6 @@ def facts(url):
     d = fetch(uid)
     num = lambda v: f"{v:,}" if isinstance(v, int) else (v if v not in (None, "") else "-")
     lic = (d.get("license") or {}).get("label") or "-"
-    price = d.get("price")
     return [
         ("Model", [
             ("Name", d.get("name")), ("Author", (d.get("user") or {}).get("displayName")),
@@ -51,7 +50,6 @@ def facts(url):
         ]),
         ("Publishing & rights", [
             ("Licence", lic), ("Downloadable by the author's choice", "yes" if d.get("isDownloadable") else "no"),
-            ("Store price", f"{price / 100:.2f} USD" if isinstance(price, int) and price else "free / not for sale"),
             ("Protected", "yes" if d.get("isProtected") else "no"),
             ("Age restricted", "yes" if d.get("isAgeRestricted") else "no"),
             ("Staff pick", (d.get("staffpickedAt") or "no")[:10]),
