@@ -21,6 +21,19 @@ Two desktop apps share this code:
 5. **API calls** feeding the page (catalogue/metadata), telemetry filtered out.
 6. Screenshot of what the page showed.
 
+## Report extras (good for presentations)
+- **Architecture at a glance** - auto-drawn diagram: API -> page -> storage/CDN -> files -> decoder -> 3D engine -> GPU.
+- **Lessons for your own site** - score /100 + tips: geometry compression, transfer compression, CDN, caching,
+  download size, texture compression (KTX2), draw calls / instancing, access to files.
+- **Load timeline** - when each model file / texture arrived (waterfall, bar width ~ size).
+- **Glossary** - plain-English explanation of every term that appears in the report.
+- **History + Compare** - every run is saved (`reports/*.json`); pick 2 in the window -> side-by-side table.
+- **Save as PDF** - landscape A4, to hand in.
+
+## Browsers
+`Auto` (Brave if installed, else Playwright's Chromium), `Brave`, `Chromium`, `Firefox` (Gecko engine - Playwright's
+build: `venv/bin/python -m playwright install chromium firefox`). Command line: `--browser=Firefox`.
+
 ## How it works
 `inspect_site.py` opens the link in a hidden Brave (separate temporary profile, real GPU so sites
 serve live 3D), records network responses (metadata only), wakes lazy viewers (scroll, "View in 3D"/"Play"
@@ -40,7 +53,7 @@ and are not worked around.
 python -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python gui.py              # universal window
 venv/bin/python gui.py --sketchfab  # Sketchfab window
-venv/bin/python inspect_site.py <url>   # command line
+venv/bin/python inspect_site.py [--assisted] [--browser=Firefox] <url>   # command line
 ```
 Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome/Chromium).
 
