@@ -1,0 +1,47 @@
+# Site Inspector
+
+Study tool: paste a link to a web page that shows a 3D model, and get a report on
+**how the model is made visible, how it is stored, and how it is delivered**.
+
+Two desktop apps share this code:
+- **Site Inspector** (`gui.py`) - universal: any site with a live 3D view.
+- **Sketchfab Inspector** (`gui.py --sketchfab`) - adds model facts from Sketchfab's official
+  Data API v3 (geometry, materials, textures, licence, popularity) to the live analysis.
+
+## What it reports
+1. **Client side** - the engine/viewer (three.js, `<model-viewer>`, Babylon.js, PlayCanvas, Verge3D,
+   Spline, Needle, A-Frame, xeokit, Potree, Marmoset, 3DHOP, Online3DViewer, Unity, Sketchfab...) and WebGL use.
+2. **Files** - format (glTF/GLB, OBJ, STL, 3MF, USDZ, splats, 3D Tiles, point clouds, IFC, Sketchfab .binz...),
+   size, transfer compression, CDN / storage (CloudFront, S3, Cloudflare, Fastly, GCS, Azure...),
+   signed links, login, CORS, caching, plus texture images.
+3. **Compression decoders** - Draco, Meshopt, KTX2/Basis (WebAssembly).
+4. **API calls** feeding the page (catalogue/metadata), telemetry filtered out.
+5. Screenshot of what the page showed.
+
+## How it works
+`inspect_site.py` opens the link in a hidden Brave (separate temporary profile, real GPU so sites
+serve live 3D), records network responses (metadata only), wakes lazy viewers (scroll, "View in 3D"/"Play"
+buttons, canvas click - never follows links), asks every frame which engine it runs, then writes
+`reports/<host>-<time>.html`.
+
+It is an architecture report only: response bodies are never read or saved and file links are
+shortened to host + format. Sites that block automated visits (bot protection) are reported as such
+and are not worked around.
+
+## Run
+```
+python -m venv venv && venv/bin/pip install -r requirements.txt
+venv/bin/python gui.py              # universal window
+venv/bin/python gui.py --sketchfab  # Sketchfab window
+venv/bin/python inspect_site.py <url>   # command line
+```
+Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome/Chromium).
+
+## Tested (2026-10-16)
+| Site | Result |
+|---|---|
+| Sketchfab | in-house OSG.JS engine, .binz scene + geometry on CloudFront, progressive textures |
+| threejs.org examples / 3dviewer.net | three.js, GLB on Fastly |
+| modelviewer.dev | model-viewer on three.js, GLB, Meshopt |
+| Babylon.js sandbox | Babylon.js 9.30, GLB on Azure Blob Storage |
+| Printables, TurboSquid | blocked automated visits (reported, not bypassed) |
