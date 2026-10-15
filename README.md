@@ -37,8 +37,12 @@ build: `venv/bin/python -m playwright install chromium firefox`). Command line: 
 ## How it works
 `inspect_site.py` opens the link in a hidden Brave (separate temporary profile, real GPU so sites
 serve live 3D), records network responses (metadata only), wakes lazy viewers (scroll, "View in 3D"/"Play"
-buttons, canvas click - never follows links), asks every frame which engine it runs, then writes
+buttons, canvas click), asks every frame which engine it runs, then writes
 `reports/<host>-<time>.html`.
+
+**Gallery / index links:** if the pasted page shows no 3D, it opens the most model-like page linked from it
+on the same site (address words like model/object/3d/sample, or thumbnail links in a gallery grid) and analyses that,
+up to 2 tries. The report says which page it opened.
 
 **Assisted mode** (tick "I'll open it myself", or `inspect_site.py --assisted <url>`): for sites with an
 "are you human" check. A visible Brave window opens with its own profile (`~/.cache/site-inspector-profile`,
@@ -66,4 +70,7 @@ Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome
 | Babylon.js sandbox | Babylon.js 9.30, GLB on Azure Blob Storage |
 | bruno-simon.com | three.js r183 on **WebGPU**, Draco + Basis + Rapier physics WASM, ~131 draws/frame, 36k instanced |
 | playcanvas.com | engine name hidden -> identified by the GPU catch-all (1.1k buffers, 2k instanced draws) |
-| Printables, TurboSquid | block the hidden browser -> use assisted mode |
+| eyes.nasa.gov/curiosity | Verge3D (three.js fork) r2.5.0, CloudFront, ~203 draws/frame |
+| engine.needle.tools/samples (gallery) | auto-opened a sample -> Needle Engine on three.js, 21 GLB, Draco + Basis |
+| modely.cesnet.cz (museum gallery) | auto-opened an object page -> in-house engine via GPU catch-all, heavy instancing |
+| Printables, TurboSquid, 3d.si.edu | block the hidden browser -> use assisted mode |
