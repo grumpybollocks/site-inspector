@@ -439,6 +439,8 @@ def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto
         except Exception:
             found["gpu"] = None
         found["wasm"] = wasm
+        k, fmt = classify(url, "")
+        found["direct_file"] = fmt if k == "model" else None   # the link itself is a 3D file, not a page
         found["browser"] = used + (" (visible, assisted)" if assisted else " (hidden)")
         shot = REPORTS / f"shot-{int(t0)}.png"
         REPORTS.mkdir(exist_ok=True)
@@ -472,6 +474,10 @@ def summary(found, records, decoders):
     if found.get("blocked"):
         return ["This site blocked automated inspection (bot-protection / 'are you human' page), so nothing about "
                 "its 3D delivery could be seen. Open the page in your own browser and use F12 > Network instead."]
+    if found.get("direct_file"):
+        return [f"This link points straight at a 3D file ({found['direct_file']}), not at a web page. Paste the link "
+                "of the page that SHOWS the model (model page, product page, viewer) to see how a site displays and "
+                "delivers it."]
     libs = found["libs"]
     if libs:
         lines.append("Drawn with " + ", ".join(f"{k} {v}" for k, v in libs.items()) + ".")
