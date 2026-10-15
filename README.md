@@ -14,15 +14,22 @@ Two desktop apps share this code:
 2. **Files** - format (glTF/GLB, OBJ, STL, 3MF, USDZ, splats, 3D Tiles, point clouds, IFC, Sketchfab .binz...),
    size, transfer compression, CDN / storage (CloudFront, S3, Cloudflare, Fastly, GCS, Azure...),
    signed links, login, CORS, caching, plus texture images.
-3. **Compression decoders** - Draco, Meshopt, KTX2/Basis (WebAssembly).
-4. **API calls** feeding the page (catalogue/metadata), telemetry filtered out.
-5. Screenshot of what the page showed.
+3. **Catch-all (any engine, even unknown/in-house)** - a probe injected before the site's own code counts
+   what reaches the GPU: WebGL/WebGPU contexts, geometry buffers + bytes, textures, shader programs /
+   pipelines, draw calls per frame, fps, GPU instancing, WebAssembly modules, web workers. Counts only, no data.
+4. **Compression decoders** - Draco, Meshopt, KTX2/Basis (WebAssembly).
+5. **API calls** feeding the page (catalogue/metadata), telemetry filtered out.
+6. Screenshot of what the page showed.
 
 ## How it works
 `inspect_site.py` opens the link in a hidden Brave (separate temporary profile, real GPU so sites
 serve live 3D), records network responses (metadata only), wakes lazy viewers (scroll, "View in 3D"/"Play"
 buttons, canvas click - never follows links), asks every frame which engine it runs, then writes
 `reports/<host>-<time>.html`.
+
+**Assisted mode** (tick "I'll open it myself", or `inspect_site.py --assisted <url>`): for sites with an
+"are you human" check. A visible Brave window opens with its own profile (`~/.cache/site-inspector-profile`,
+never your real Brave profile); you browse and pass the check yourself, then press "Page is ready – analyse".
 
 It is an architecture report only: response bodies are never read or saved and file links are
 shortened to host + format. Sites that block automated visits (bot protection) are reported as such
@@ -44,4 +51,6 @@ Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome
 | threejs.org examples / 3dviewer.net | three.js, GLB on Fastly |
 | modelviewer.dev | model-viewer on three.js, GLB, Meshopt |
 | Babylon.js sandbox | Babylon.js 9.30, GLB on Azure Blob Storage |
-| Printables, TurboSquid | blocked automated visits (reported, not bypassed) |
+| bruno-simon.com | three.js r183 on **WebGPU**, Draco + Basis + Rapier physics WASM, ~131 draws/frame, 36k instanced |
+| playcanvas.com | engine name hidden -> identified by the GPU catch-all (1.1k buffers, 2k instanced draws) |
+| Printables, TurboSquid | block the hidden browser -> use assisted mode |

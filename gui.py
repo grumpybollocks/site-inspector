@@ -52,6 +52,15 @@ class App(tk.Tk):
         self.go = ttk.Button(row, text="Inspect", style="Accent.TButton", command=self.start)
         self.go.pack(side="left")
 
+        opt = tk.Frame(self, bg=BG)
+        opt.pack(fill="x", padx=20, pady=(0, 8))
+        self.assisted = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt, text="I'll open it myself (for sites with an \"are you human\" check, e.g. Printables, TurboSquid)",
+                       variable=self.assisted, bg=BG, fg=TEXT, selectcolor=CARD, activebackground=BG,
+                       activeforeground=TEXT, highlightthickness=0).pack(side="left")
+        self.ready_btn = ttk.Button(opt, text="Page is ready – analyse", style="Accent.TButton", command=self.page_ready)
+        self.ready_event = threading.Event()
+
         self.bar = ttk.Progressbar(self, mode="indeterminate")
         self.bar.pack(fill="x", padx=20)
         self.status = tk.Label(self, text="Ready.", bg=BG, fg=MUTED, anchor="w")
@@ -72,7 +81,8 @@ class App(tk.Tk):
 
         self.write([("Tips", "h"),
                     ("• Works on most 3D sites: Sketchfab, three.js / model-viewer pages, product viewers.\n", None),
-                    ("• Some sites (TurboSquid, Printables) block automated visits - the result will say so.\n", None),
+                    ("• Sites with an \"are you human\" check (TurboSquid, Printables): tick “I'll open it myself”, "
+                     "pass the check in the window that opens, then press “Page is ready – analyse”.\n", None),
                     ("• Each inspection takes about 20 seconds and runs in a hidden browser; your Brave is not touched.", None)])
         self.url.focus_set()
 
@@ -104,9 +114,22 @@ class App(tk.Tk):
         self.bar.start(12)
         self.status.configure(text="Inspecting… (about 20 seconds)", fg=MUTED)
         self.write([("Working…", "m")])
-        threading.Thread(target=self.work, args=(link,), daemon=True).start()
+        self.ready_event.clear()
+        threading.Thread(target=self.work, args=(link, self.assisted.get()), daemon=True).start()
 
-    def work(self, link):
+    def waiting_for_user(self):
+        self.bar.stop()
+        self.status.configure(text="A browser window opened. Browse normally, pass any human check, open the 3D view, "
+                                   "then press “Page is ready – analyse”.", fg=ACCENT)
+        self.ready_btn.pack(side="right")
+
+    def page_ready(self):
+        self.ready_btn.pack_forget()
+        self.bar.start(12)
+        self.status.configure(text="Analysing the page you opened…", fg=MUTED)
+        self.ready_event.set()
+
+    def work(self, link, assisted=False):
         try:
             extra = None
             if sketchfab.uid_of(link):
@@ -114,7 +137,9 @@ class App(tk.Tk):
                     extra = sketchfab.facts(link)
                 except Exception as e:
                     extra = [("Data API", [("error", str(e))])]
-            found, records, decoders, apis, shot, secs = core.inspect(link)
+            found, records, decoders, apis, shot, secs = core.inspect(
+                link, assisted=assisted, ready=self.ready_event,
+                on_waiting=lambda: self.after(0, self.waiting_for_user))
             found["sketchfab"] = extra
             for sec, rows in extra or []:
                 for k, v in rows:
@@ -127,6 +152,7 @@ class App(tk.Tk):
 
     def done(self, link, found, records, decoders, apis, path, secs, err):
         self.bar.stop()
+        self.ready_btn.pack_forget()
         self.go.configure(state="normal")
         if err:
             self.status.configure(text="Something went wrong.", fg="#e07a6a")

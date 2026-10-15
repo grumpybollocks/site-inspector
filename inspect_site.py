@@ -126,7 +126,7 @@ def cdn_of(headers):
     if "x-bunny" in " ".join(h) or "bunnycdn" in srv: return "BunnyCDN"
     if "x-vercel-id" in h: return "Vercel"
     if "x-nf-request-id" in h: return "Netlify"
-    return h.get("server", "") or "unknown"
+    return f"own web server ({h['server']})" if h.get("server") else "own web server"
 
 
 TELEMETRY = re.compile(r"sentry|google-analytics|googletagmanager|doubleclick|segment\.|hotjar|mixpanel|amplitude|"
@@ -159,6 +159,103 @@ def sketchfab_embed(url):
     URL with autostart=1 starts the viewer straight away (documented embed option)."""
     m = re.search(r"sketchfab\.com/(?:3d-models/[^/?#]*-|models/)([0-9a-f]{32})", url)
     return f"https://sketchfab.com/models/{m.group(1)}/embed?autostart=1&ui_infos=0" if m else url
+
+
+# CATCH-ALL: runs in every frame before the site's own code. Whatever engine a site uses,
+# it must hand geometry and textures to WebGL/WebGPU to draw them, so counting those calls
+# describes ANY 3D site, even an unknown in-house engine. Only counts and sizes are kept,
+# never the data itself.
+GPU_PROBE_JS = r"""(() => {
+  if (window.__si) return;
+  const S = window.__si = {ctx: {}, buffers: 0, bufferBytes: 0, textures: 0, programs: 0,
+                           draws: 0, instanced: 0, frames: 0, webgpu: false, webgpuDevice: false, wasm: 0, workers: 0};
+  const gc = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, ...a) {
+    const c = gc.call(this, type, ...a);
+    if (c && /webgl|webgpu/i.test(type)) S.ctx[type] = (S.ctx[type] || 0) + 1;
+    return c;
+  };
+  if (window.OffscreenCanvas) {
+    const og = OffscreenCanvas.prototype.getContext;
+    OffscreenCanvas.prototype.getContext = function (type, ...a) {
+      const c = og.call(this, type, ...a);
+      if (c && /webgl|webgpu/i.test(type)) S.ctx['offscreen ' + type] = (S.ctx['offscreen ' + type] || 0) + 1;
+      return c;
+    };
+  }
+  const size = d => typeof d === 'number' ? d : (d && d.byteLength) || 0;
+  for (const C of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {
+    if (!C) continue;
+    const p = C.prototype, wrap = (name, fn) => { const o = p[name]; if (o) p[name] = function (...a) { fn(a); return o.apply(this, a); }; };
+    wrap('bufferData', a => { S.buffers++; S.bufferBytes += size(a[1]); });
+    wrap('texImage2D', () => S.textures++);
+    wrap('texImage3D', () => S.textures++);
+    wrap('compressedTexImage2D', () => S.textures++);
+    wrap('texStorage2D', () => S.textures++);
+    wrap('linkProgram', () => S.programs++);
+    wrap('drawElements', () => S.draws++);
+    wrap('drawArrays', () => S.draws++);
+    wrap('drawElementsInstanced', () => { S.draws++; S.instanced++; });
+    wrap('drawArraysInstanced', () => { S.draws++; S.instanced++; });
+  }
+  if (navigator.gpu && navigator.gpu.requestAdapter) {
+    const ra = navigator.gpu.requestAdapter.bind(navigator.gpu);
+    navigator.gpu.requestAdapter = (...a) => { S.webgpu = true; return ra(...a).then(ad => {
+      if (ad) { const rd = ad.requestDevice.bind(ad); ad.requestDevice = (...b) => { S.webgpuDevice = true; return rd(...b); }; }
+      return ad; }); };
+  }
+  // WebGPU: the newer graphics API - same idea, different calls
+  const wrapP = (C, name, fn) => { if (C && C.prototype[name]) { const o = C.prototype[name];
+    C.prototype[name] = function (...a) { try { fn(a); } catch (e) {} return o.apply(this, a); }; } };
+  wrapP(window.GPUDevice, 'createBuffer', a => { S.buffers++; S.bufferBytes += (a[0] && a[0].size) || 0; });
+  wrapP(window.GPUDevice, 'createTexture', () => S.textures++);
+  wrapP(window.GPUDevice, 'createRenderPipeline', () => S.programs++);
+  wrapP(window.GPUDevice, 'createRenderPipelineAsync', () => S.programs++);
+  for (const E of [window.GPURenderPassEncoder, window.GPURenderBundleEncoder]) {
+    wrapP(E, 'draw', a => { S.draws++; if (a[1] > 1) S.instanced++; });
+    wrapP(E, 'drawIndexed', a => { S.draws++; if (a[1] > 1) S.instanced++; });
+    wrapP(E, 'drawIndirect', () => S.draws++);
+    wrapP(E, 'drawIndexedIndirect', () => S.draws++);
+  }
+  for (const k of ['instantiate', 'instantiateStreaming', 'compile', 'compileStreaming']) {
+    const o = WebAssembly[k]; if (o) WebAssembly[k] = function (...a) { S.wasm++; return o.apply(this, a); };
+  }
+  const W = window.Worker; if (W) window.Worker = function (...a) { S.workers++; return new W(...a); };
+  const raf = window.requestAnimationFrame.bind(window);
+  window.requestAnimationFrame = cb => raf(t => { S.frames++; return cb(t); });
+})();"""
+
+GPU_READ_JS = "() => window.__si ? JSON.parse(JSON.stringify(window.__si)) : null"
+
+
+def gpu_stats(page):
+    """Sum the probe counters over all frames, and measure draw calls per frame over 2 s."""
+    def total():
+        t = {"ctx": {}, "buffers": 0, "bufferBytes": 0, "textures": 0, "programs": 0, "draws": 0,
+             "instanced": 0, "frames": 0, "webgpu": False, "webgpuDevice": False, "wasm": 0, "workers": 0}
+        for fr in page.frames:
+            try:
+                s = fr.evaluate(GPU_READ_JS)
+            except Exception:
+                s = None
+            if not s:
+                continue
+            for k, v in s.items():
+                if k == "ctx":
+                    for ck, cv in v.items():
+                        t["ctx"][ck] = t["ctx"].get(ck, 0) + cv
+                elif isinstance(v, bool):
+                    t[k] = t[k] or v
+                else:
+                    t[k] += v
+        return t
+    a = total()
+    page.wait_for_timeout(2000)
+    b = total()
+    frames = b["frames"] - a["frames"]
+    b["fps"] = round(frames / 2)
+    b["draws_per_frame"] = round((b["draws"] - a["draws"]) / frames) if frames else 0
+    return b
 
 
 WAKE_JS = r"""() => {
@@ -201,21 +298,34 @@ def wake_viewers(page):
     return triggered
 
 
-def inspect(url):
+GPU_ARGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--ignore-gpu-blocklist", "--enable-gpu"]
+SOFT_ARGS = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"]
+# Assisted mode keeps its own profile (never the user's real Brave profile), so a human check
+# the user passes there is remembered for next time.
+ASSISTED_PROFILE = Path.home() / ".cache" / "site-inspector-profile"
+
+
+def inspect(url, assisted=False, ready=None, on_waiting=None):
+    """assisted=True: open a VISIBLE browser, the user browses / passes any human check
+    themselves, and the analysis starts when `ready` (threading.Event) is set."""
     records, decoders, apis, images = [], {}, {}, []
     url = sketchfab_embed(url)
     with sync_playwright() as p:
-        # Real GPU first: sites like Sketchfab test the browser and serve a still image
-        # instead of live 3D when they only get software rendering.
-        try:
-            browser = p.chromium.launch(executable_path=BRAVE, headless=True,
-                                        args=["--use-angle=vulkan", "--enable-features=Vulkan",
-                                              "--ignore-gpu-blocklist", "--enable-gpu"])
-        except Exception:
-            browser = p.chromium.launch(executable_path=BRAVE, headless=True,
-                                        args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-                                              "--ignore-gpu-blocklist"])
-        page = browser.new_page(viewport={"width": 1400, "height": 900})
+        browser = None
+        if assisted:
+            ctx = p.chromium.launch_persistent_context(str(ASSISTED_PROFILE), executable_path=BRAVE,
+                                                       headless=False, no_viewport=True, args=GPU_ARGS)
+        else:
+            # Real GPU first: sites like Sketchfab test the browser and serve a still image
+            # instead of live 3D when they only get software rendering.
+            try:
+                browser = p.chromium.launch(executable_path=BRAVE, headless=True, args=GPU_ARGS)
+            except Exception:
+                browser = p.chromium.launch(executable_path=BRAVE, headless=True, args=SOFT_ARGS)
+            ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+        ctx.add_init_script(GPU_PROBE_JS)   # catch-all GPU probe, injected into every frame of every tab
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        wasm = {}
 
         def on_response(resp):
             try:
@@ -225,6 +335,8 @@ def inspect(url):
                 if req.resource_type == "image":
                     images.append((urlsplit(resp.url).netloc, size))
                     return
+                if "wasm" in ctype or ext_of(resp.url) == "wasm":
+                    wasm[urlsplit(resp.url).path.rsplit("/", 1)[-1][:60]] = size
                 kind, label = classify(resp.url, ctype)
                 if not kind and req.resource_type in ("fetch", "xhr") and size > 50_000 and \
                         ("octet-stream" in ctype or "binary" in ctype or not ctype):
@@ -256,13 +368,21 @@ def inspect(url):
             except Exception:
                 pass
 
-        page.on("response", on_response)
+        ctx.on("response", on_response)   # all tabs, so it also follows wherever the user clicks
         t0 = time.time()
         try:
             page.goto(url, wait_until="load", timeout=60000)
         except Exception as e:
             print(f"Page load problem: {e}", file=sys.stderr)
-        page.wait_for_timeout(WAIT_AFTER_LOAD * 1000)
+        if assisted:
+            if on_waiting:
+                on_waiting()
+            if ready:
+                ready.wait(timeout=1800)       # the user says "page is ready" (max 30 min)
+            page = ctx.pages[-1] if ctx.pages else page   # analyse the tab they ended on
+            page.wait_for_timeout(3000)
+        else:
+            page.wait_for_timeout(WAIT_AFTER_LOAD * 1000)
         if wake_viewers(page):
             page.wait_for_timeout(8000)  # give a just-started viewer time to fetch its files
         try:
@@ -276,13 +396,20 @@ def inspect(url):
                     pass
         except Exception:
             found = {"blocked": False, "libs": {}, "embeds": [], "webgl": 0, "webgl2": 0, "scripts": [], "title": ""}
+        try:
+            found["gpu"] = gpu_stats(page)
+        except Exception:
+            found["gpu"] = None
+        found["wasm"] = wasm
         shot = REPORTS / f"shot-{int(t0)}.png"
         REPORTS.mkdir(exist_ok=True)
         try:
             page.screenshot(path=str(shot))
         except Exception:
             shot = None
-        browser.close()
+        ctx.close()
+        if browser:
+            browser.close()
     # textures = images served from the same hosts as the model files
     model_hosts = {r["where"].split("/")[0] for r in records}
     found["textures"] = [s for h, s in images if h in model_hosts]
@@ -296,6 +423,11 @@ def human(n):
     return f"{n/1048576:.1f} MB" if n >= 1048576 else f"{n/1024:.0f} KB" if n >= 1024 else f"{n} bytes"
 
 
+def gpu_active(found):
+    g = found.get("gpu")
+    return bool(g and (g["buffers"] or g["draws"] or g["webgpuDevice"]))
+
+
 def summary(found, records, decoders):
     lines = []
     if found.get("blocked"):
@@ -307,8 +439,8 @@ def summary(found, records, decoders):
     elif found["embeds"]:
         lines.append("The 3D view is an embedded third-party viewer: " + ", ".join(found["embeds"]) +
                      " (the model lives on that service, not on this site).")
-    elif found["webgl"] or found["webgl2"]:
-        lines.append("A WebGL canvas is active, but the engine hides its name (bundled/minified build).")
+    elif found["webgl"] or found["webgl2"] or gpu_active(found):
+        lines.append("Unknown or in-house 3D engine (no public library name) - identified by the GPU catch-all below.")
     else:
         lines.append("No WebGL canvas or known 3D viewer found - the model may load only after a click, "
                      "or this page shows images/video instead of live 3D.")
@@ -327,7 +459,8 @@ def summary(found, records, decoders):
     tex = found.get("textures") or []
     if tex:
         sized = [t for t in tex if t]
-        rng = f" ({human(min(sized))} to {human(max(sized))})" if sized else ""
+        rng = "" if not sized else f" ({human(min(sized))})" if min(sized) == max(sized) else \
+            f" ({human(min(sized))} to {human(max(sized))})"
         lines.append(f"{len(tex)} texture image(s){rng} loaded from the same storage as the model.")
         api_tex = found.get("api_textures")
         if isinstance(api_tex, int) and api_tex and len(tex) > api_tex:
@@ -336,9 +469,36 @@ def summary(found, records, decoders):
     if found.get("fallback") and not models:
         lines.append("The site served its 'fallback' (a still image instead of live 3D) because it judged this "
                      "browser unable to run the 3D viewer - a capability check worth mentioning.")
+    g = found.get("gpu")
+    if gpu_active(found):
+        api = "WebGPU" if g["webgpuDevice"] else "WebGL"
+        lines.append(f"GPU catch-all ({api}): {g['buffers']} geometry/data buffers ({human(g['bufferBytes'])}) and "
+                     f"{g['textures']} textures uploaded, {g['programs']} shader programs/pipelines, "
+                     f"~{g['draws_per_frame']} draw calls per frame at ~{g['fps']} fps"
+                     + (f", {g['instanced']} instanced draws (GPU instancing)" if g["instanced"] else "") + ".")
+        if g["draws"] and not g["draws_per_frame"]:
+            lines.append("It renders on demand: the scene is redrawn only when the view changes, not every frame "
+                         "(saves battery and GPU while the model sits still).")
+    if found.get("wasm"):
+        lines.append("WebAssembly modules (decoders / engine core): " + ", ".join(found["wasm"]) + ".")
     if decoders:
         lines.append("Compression: " + ", ".join(decoders) + " (decoded in the browser with WebAssembly).")
     return lines
+
+
+def gpu_table(found):
+    g = found.get("gpu")
+    if not g:
+        return "<p>no data</p>"
+    rows = [("Graphics contexts", ", ".join(f"{k} ×{v}" for k, v in g["ctx"].items()) or "none"),
+            ("WebGPU", "device created" if g["webgpuDevice"] else "adapter requested only" if g["webgpu"] else "not used"),
+            ("Geometry / data buffers uploaded", f"{g['buffers']:,}  ({human(g['bufferBytes'])})"),
+            ("Textures uploaded", f"{g['textures']:,}"), ("Shader programs linked", f"{g['programs']:,}"),
+            ("Draw calls per frame", f"~{g['draws_per_frame']:,}  (instanced draws total: {g['instanced']:,})"),
+            ("Frame rate while inspected", f"~{g['fps']} fps"),
+            ("WebAssembly modules", f"{g['wasm']} instantiated · files: " + (", ".join(found.get('wasm') or {}) or "none")),
+            ("Web workers started", f"{g['workers']}")]
+    return "<table>" + "".join(f"<tr><th style='width:280px'>{escape(k)}</th><td>{escape(str(v))}</td></tr>" for k, v in rows) + "</table>"
 
 
 def report(url, found, records, decoders, apis, shot, secs, extra=None):
@@ -371,6 +531,8 @@ th{{background:#1e2229}} .sum li{{margin:6px 0;font-size:15px}} img{{max-width:1
 <h2>2 · How it is stored and delivered (files)</h2>
 <table><tr><th>Type</th><th>Format</th><th>Stored at</th><th>Size</th><th>Transfer compression</th><th>CDN / storage</th>
 <th>Signed link</th><th>Login sent</th><th>CORS</th><th>Caching</th><th>Loaded via</th></tr>{rows or '<tr><td colspan=11>No 3D files or textures seen</td></tr>'}</table>
+<h2>Catch-all · what the GPU received (works for any engine)</h2>
+{gpu_table(found)}
 <h2>3 · Compression decoders</h2><ul>{li([f"{k} (from {v})" for k, v in decoders.items()])}</ul>
 <h2>4 · API calls feeding the page (catalogue / metadata)</h2><ul>{li([f"{k}  → HTTP {v}" for k, v in list(apis.items())[:30]])}</ul>
 <h2>What the page looked like</h2>{f'<img src="{shot.name}">' if shot else '<p>no screenshot</p>'}
@@ -383,9 +545,19 @@ th{{background:#1e2229}} .sum li{{margin:6px 0;font-size:15px}} img{{max-width:1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or not sys.argv[1].startswith(("http://", "https://")):
-        sys.exit("Usage: inspect_site.py <http(s) link>")
-    found, records, decoders, apis, shot, secs = inspect(sys.argv[1])
+    assisted = "--assisted" in sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--assisted"]
+    if len(args) != 1 or not args[0].startswith(("http://", "https://")):
+        sys.exit("Usage: inspect_site.py [--assisted] <http(s) link>")
+    sys.argv[1:] = args
+    if assisted:
+        import threading
+        ev = threading.Event()
+        found, records, decoders, apis, shot, secs = inspect(
+            args[0], assisted=True, ready=ev,
+            on_waiting=lambda: (input("Browse / pass any check in the window, then press Enter here... "), ev.set()))
+    else:
+        found, records, decoders, apis, shot, secs = inspect(args[0])
     for line in summary(found, records, decoders):
         print(line)
     extra = None
