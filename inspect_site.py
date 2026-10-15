@@ -62,7 +62,7 @@ DETECT_JS = r"""() => {
   if (window.Sketchfab) out['Sketchfab Viewer API'] = 'script';
   if (window.createUnityInstance || window.UnityLoader) out['Unity WebGL'] = 'build';
   if (window.SPLAT || window.GaussianSplats3D) out['Gaussian splat viewer'] = 'script';
-  if (window.v3d) out['Verge3D'] = (v3d.REVISION ? 'r' + v3d.REVISION : '?');
+  if (window.v3d) { delete out['three.js']; out['Verge3D (built on a three.js fork)'] = (v3d.REVISION ? 'r' + v3d.REVISION : '?'); }
   if (customElements.get('spline-viewer')) out['Spline viewer'] = 'web component';
   if (customElements.get('needle-engine')) out['Needle Engine'] = 'web component';
   if (customElements.get('babylon-viewer')) out['Babylon viewer'] = 'web component';
@@ -90,7 +90,30 @@ DETECT_JS = r"""() => {
      .map(s => { const u = new URL(s); return u.host + '/' + u.pathname.split('/').pop(); });
   const txt = (document.body && document.body.innerText || '').slice(0, 3000);
   const blocked = /access (is )?(temporarily )?(restricted|denied)|just a moment|verify you are human|unusual activity|captcha|are you a robot/i.test(document.title + ' ' + txt);
-  return {blocked, libs: out, embeds: [...new Set(embeds)], webgl: gl, webgl2: gl2, scripts: [...new Set(scripts)].slice(0, 15),
+  // links on this site that look like a single model's page (used when this page itself shows no 3D)
+  const here = location.href.split('#')[0];
+  const site = location.hostname.replace(/^www\./, '');
+  const want = /(model|3d|object|objekt|item|sample|viewer|detail|artifact|artefact|scan|asset|product|exhibit|specimen|example|showcase)/i;
+  const skip = /(login|signin|sign-in|signup|register|cart|checkout|account|privacy|cookie|terms|contact|about|faq|help|blog|news|search|tags?\/|category|mailto:|javascript:|\.(pdf|zip|jpg|png)$)/i;
+  // tier 1: links whose address says "model / object / 3d / sample ..."
+  // tier 2 (any wording, e.g. /wardrobe.html): links that wrap a thumbnail image = a gallery grid
+  const home = /^\/?([a-z]{2}(-[a-z]{2})?\/?)?(index\.html?|home\/?)?$/i;   // "/", "/en/", "/index.html"
+  const seen = new Set(), candidates = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    let u; try { u = new URL(a.href); } catch (e) { continue; }
+    const href = u.href.split('#')[0];
+    if (!/^https?:/.test(u.protocol) || !u.hostname.endsWith(site) || href === here || seen.has(href)) continue;
+    if (skip.test(href) || home.test(u.pathname)) continue;
+    const thumb = !!a.querySelector('img,picture,canvas,video') ||
+                  /url\(/.test(getComputedStyle(a).backgroundImage || '');
+    const keyword = want.test(u.pathname + u.search);
+    if (!keyword && !thumb) continue;
+    seen.add(href);
+    const score = (keyword ? 3 : 0) + (thumb ? 2 : 0) + Math.min(u.pathname.split('/').filter(Boolean).length, 4) / 4;
+    candidates.push({href, score});
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  return {candidates: candidates.slice(0, 5).map(c => c.href), blocked, libs: out, embeds: [...new Set(embeds)], webgl: gl, webgl2: gl2, scripts: [...new Set(scripts)].slice(0, 15),
           title: document.title};
 }"""
 
@@ -433,7 +456,7 @@ def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto
                 except Exception:
                     pass
         except Exception:
-            found = {"blocked": False, "libs": {}, "embeds": [], "webgl": 0, "webgl2": 0, "scripts": [], "title": ""}
+            found = {"candidates": [], "blocked": False, "libs": {}, "embeds": [], "webgl": 0, "webgl2": 0, "scripts": [], "title": ""}
         try:
             found["gpu"] = gpu_stats(page)
         except Exception:
@@ -458,6 +481,30 @@ def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto
     return found, records, decoders, apis, shot, time.time() - t0
 
 
+def shows_3d(found, records):
+    g = found.get("gpu") or {}
+    return bool(found.get("libs") or found.get("embeds") or found.get("webgl") or found.get("webgl2")
+                or g.get("draws") or g.get("buffers") or any(r["kind"] == "model" for r in records))
+
+
+def inspect_smart(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto", on_status=None):
+    """inspect(), and if the pasted page is a gallery / index with no 3D on it, open the most
+    model-looking page linked from it on the same site and inspect that instead (up to 2 tries)."""
+    result = inspect(url, assisted, ready, on_waiting, browser_name)
+    found, records = result[0], result[1]
+    if assisted or found.get("blocked") or found.get("direct_file") or shows_3d(found, records):
+        return result + (url,)
+    for cand in (found.get("candidates") or [])[:2]:
+        if on_status:
+            on_status(f"No 3D on that page - it looks like a gallery. Trying a model page on the same site: {cand}"
+                      if cand == found["candidates"][0] else f"No 3D there either. Trying another one: {cand}")
+        r2 = inspect(cand, False, None, None, browser_name)
+        if shows_3d(r2[0], r2[1]):
+            r2[0]["explored_from"] = url
+            return r2 + (cand,)
+    return result + (url,)
+
+
 def human(n):
     if not n:
         return "streamed / unknown"
@@ -474,6 +521,9 @@ def summary(found, records, decoders):
     if found.get("blocked"):
         return ["This site blocked automated inspection (bot-protection / 'are you human' page), so nothing about "
                 "its 3D delivery could be seen. Open the page in your own browser and use F12 > Network instead."]
+    if found.get("explored_from"):
+        lines.append(f"The link you pasted ({found['explored_from']}) is a gallery/index page with no 3D on it, so the "
+                     "inspector opened a model page linked from it on the same site and analysed that one.")
     if found.get("direct_file"):
         return [f"This link points straight at a 3D file ({found['direct_file']}), not at a web page. Paste the link "
                 "of the page that SHOWS the model (model page, product page, viewer) to see how a site displays and "
@@ -625,7 +675,8 @@ if __name__ == "__main__":
             args[0], assisted=True, ready=ev, browser_name=bname,
             on_waiting=lambda: (input("Browse / pass any check in the window, then press Enter here... "), ev.set()))
     else:
-        found, records, decoders, apis, shot, secs = inspect(args[0], browser_name=bname)
+        found, records, decoders, apis, shot, secs, used_url = inspect_smart(args[0], browser_name=bname, on_status=print)
+        args[0] = used_url
     for line in summary(found, records, decoders):
         print(line)
     extra = None
@@ -638,4 +689,4 @@ if __name__ == "__main__":
                     found["api_textures"] = int(str(v).replace(",", ""))
     except Exception as e:
         print(f"(Sketchfab API not available: {e})", file=sys.stderr)
-    print(f"Report: {report(sys.argv[1], found, records, decoders, apis, shot, secs, extra)}")
+    print(f"Report: {report(args[0], found, records, decoders, apis, shot, secs, extra)}")
