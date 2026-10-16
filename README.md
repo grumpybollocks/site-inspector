@@ -55,12 +55,20 @@ and are not worked around.
 
 ## Run
 ```
-python -m venv venv && venv/bin/pip install -r requirements.txt
-venv/bin/python gui.py              # universal window
-venv/bin/python gui.py --sketchfab  # Sketchfab window
-venv/bin/python inspect_site.py [--assisted] [--browser=Firefox] <url>   # command line
+./setup.sh                            # once: .venv + Playwright Chromium/Firefox + offline tests
+./setup.sh --desktop                  # optional: Desktop icons pointing at this checkout
+.venv/bin/python gui.py               # universal window
+.venv/bin/python gui.py --sketchfab   # Sketchfab window
+.venv/bin/python inspect_site.py [--assisted] [--browser=Firefox] <url>   # command line
 ```
-Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome/Chromium).
+`Auto` browser = Brave at `/usr/bin/brave` if installed, otherwise Playwright's own Chromium.
+
+## For developers and AI coding agents
+Start with **[AGENTS.md](AGENTS.md)** (short on purpose, also loaded by Claude Code via `CLAUDE.md`).
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (data flow, data structures, how to extend),
+[docs/TESTING.md](docs/TESTING.md) (which test for which change, reference sites),
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) (known gotchas).
+Tests: `tests/test_offline.py` (no network, seconds) and `tests/regression.sh` (real sites, minutes).
 
 ## Tested (2026-10-16)
 | Site | Result |
