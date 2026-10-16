@@ -41,7 +41,8 @@ buttons, canvas click), asks every frame which engine it runs, then writes
 `reports/<host>-<time>.html`.
 
 **Gallery / index links:** if the pasted page shows no 3D, it opens the most model-like page linked from it
-on the same site (address words like model/object/3d/sample, or thumbnail links in a gallery grid) and analyses that,
+on the same site (address words like model/object/3d/sample, or thumbnail links in a gallery grid) and analyses that
+in the same browser session (so it also works after you passed a human check in assisted mode),
 up to 3 tries. The report says which page it opened.
 
 **Assisted mode** (tick "I'll open it myself", or `inspect_site.py --assisted <url>`): for sites with an
@@ -73,4 +74,4 @@ Requires Brave at `/usr/bin/brave` (edit `BRAVE` in `inspect_site.py` for Chrome
 | eyes.nasa.gov/curiosity | Verge3D (three.js fork) r2.5.0, CloudFront, ~203 draws/frame |
 | engine.needle.tools/samples (gallery) | auto-opened a sample -> Needle Engine on three.js, 21 GLB, Draco + Basis |
 | modely.cesnet.cz (museum gallery) | auto-opened an object page -> in-house engine via GPU catch-all, heavy instancing |
-| Printables, TurboSquid, 3d.si.edu | block the hidden browser -> use assisted mode |
+| Printables, TurboSquid, 3d.si.edu | Cloudflare / human check -> assisted mode: pass the check yourself, then "Page is ready" (3d.si.edu does not clear by itself, verified 2026-10-16) |

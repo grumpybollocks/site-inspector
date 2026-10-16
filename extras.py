@@ -45,9 +45,11 @@ def lessons(found, records, decoders):
         return None, [("info", "Nothing to grade", "No 3D files or GPU drawing were seen on this page.")]
 
     if models:
-        comp = bool(decoders) or any(COMPRESSED_FORMATS.search(r["format"]) for r in models)
+        # only GEOMETRY decoders count here - a texture decoder (Basis/KTX2) says nothing about the mesh
+        geo_dec = [d for d in decoders if re.search(r"Draco|Meshopt", d)]
+        comp = bool(geo_dec) or any(COMPRESSED_FORMATS.search(r["format"]) for r in models)
         out.append(("ok" if comp else "tip", "Geometry compression",
-                    "Geometry is compressed (" + (", ".join(decoders) or "compressed format") + ")." if comp else
+                    "Geometry is compressed (" + (", ".join(geo_dec) or "compressed format") + ")." if comp else
                     "Geometry is sent uncompressed. Draco or Meshopt (glTF extensions) usually make it 5-10x smaller."))
         text = [r for r in models if TEXT_FORMATS.search(r["format"])]
         if text:

@@ -46,9 +46,9 @@ MODEL_EXT = {"glb": "glTF binary", "gltf": "glTF JSON", "bin": "binary buffer (.
              "sog": "Gaussian splat (compressed)", "dracomesh": "Draco mesh", "vtk": "VTK", "pcd": "PCD point cloud"}
 TEXTURE_EXT = {"ktx2": "KTX2 GPU texture", "basis": "Basis texture", "hdr": "HDR environment",
                "exr": "EXR environment", "env": "Babylon environment"}
-DECODERS = {"draco": "Draco geometry compression", "meshopt": "Meshopt compression",
-            "basis_transcoder": "Basis/KTX2 texture compression", "ktx2": "KTX2 texture compression",
-            "rhino3dm": "Rhino decoder", "ifc": "IFC (BIM) decoder"}
+DECODERS = {r"draco": "Draco geometry compression", r"meshopt": "Meshopt compression",
+            r"basis_transcoder|basis": "Basis/KTX2 texture compression", r"ktx2|libktx": "KTX2 texture compression",
+            r"rhino3dm": "Rhino decoder", r"(^|[^a-z])(web-?ifc|ifc)([^a-z]|$)": "IFC (BIM) decoder"}
 SIGNED_KEYS = re.compile(r"signature|x-amz-|expires|^exp$|token|^sig$|policy|key-pair-id|hdnts|^st$|^e$", re.I)
 
 DETECT_JS = r"""() => {
@@ -88,8 +88,11 @@ DETECT_JS = r"""() => {
   const scripts = [...document.scripts].map(s => s.src).filter(Boolean)
      .filter(s => /three|babylon|model-viewer|playcanvas|cesium|draco|meshopt|unity|splat|viewer|webgl/i.test(s))
      .map(s => { const u = new URL(s); return u.host + '/' + u.pathname.split('/').pop(); });
-  const txt = (document.body && document.body.innerText || '').slice(0, 3000);
-  const blocked = /access (is )?(temporarily )?(restricted|denied)|just a moment|verify you are human|unusual activity|captcha|are you a robot/i.test(document.title + ' ' + txt);
+  // bot-check page? Judge the title, or a SHORT page whose text is about the check. A normal page that
+  // merely mentions "protected by reCAPTCHA" in its footer must not count as blocked.
+  const txt = (document.body && document.body.innerText || '');
+  const gate = /just a moment|attention required|access (is )?(temporarily )?(restricted|denied)|verify(ing)? (that )?you are (a )?human|are you a robot|checking your browser|security check|unusual (traffic|activity)/i;
+  const blocked = gate.test(document.title) || (txt.length < 1500 && (gate.test(txt) || /complete the captcha|solve the captcha/i.test(txt)));
   // links on this site that look like a single model's page (used when this page itself shows no 3D)
   const norm = h => h.split('#')[0].replace(/\/+$/, '');
   const here = norm(location.href);
@@ -173,9 +176,10 @@ def classify(url, ctype):
         return "model", MODEL_EXT.get(e, ctype)
     if e in TEXTURE_EXT:
         return "texture", TEXTURE_EXT[e]
-    for key, label in DECODERS.items():
-        if key in low and (e in ("js", "wasm") or "wasm" in ctype or "javascript" in ctype):
-            return "decoder", label
+    if e in ("js", "mjs", "wasm") or "wasm" in ctype or "javascript" in ctype:
+        for pat, label in DECODERS.items():
+            if re.search(pat, name):
+                return "decoder", label
     if TELEMETRY.search(low):
         return None, None
     if ("json" in ctype and e != "json") or "/api/" in low or "graphql" in low:
@@ -249,7 +253,8 @@ GPU_PROBE_JS = r"""(() => {
   for (const k of ['instantiate', 'instantiateStreaming', 'compile', 'compileStreaming']) {
     const o = WebAssembly[k]; if (o) WebAssembly[k] = function (...a) { S.wasm++; return o.apply(this, a); };
   }
-  const W = window.Worker; if (W) window.Worker = function (...a) { S.workers++; return new W(...a); };
+  if (window.Worker) window.Worker = new Proxy(window.Worker, {
+    construct(T, a, nt) { S.workers++; return Reflect.construct(T, a, nt); } });
   const raf = window.requestAnimationFrame.bind(window);
   window.requestAnimationFrame = cb => raf(t => { S.frames++; return cb(t); });
 })();"""
@@ -363,11 +368,11 @@ def open_browser(p, which, assisted):
     return browser, browser.new_context(viewport={"width": 1400, "height": 900}), which
 
 
-def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto"):
+def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto", on_status=None):
     """assisted=True: open a VISIBLE browser, the user browses / passes any human check
     themselves, and the analysis starts when `ready` (threading.Event) is set."""
     records, decoders, apis, images = [], {}, {}, []
-    seen = set()
+    seen, seen_img = set(), set()
     url = sketchfab_embed(url)
     with sync_playwright() as p:
         t0 = time.time()
@@ -382,7 +387,9 @@ def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto
                 ctype = (resp.headers.get("content-type") or "").split(";")[0].lower()
                 size = int(resp.headers.get("content-length") or 0)
                 if req.resource_type == "image":
-                    images.append((urlsplit(resp.url).netloc, size))
+                    if resp.url not in seen_img:
+                        seen_img.add(resp.url)
+                        images.append((urlsplit(resp.url).netloc, size))
                     return
                 if "wasm" in ctype or ext_of(resp.url) == "wasm":
                     wasm[urlsplit(resp.url).path.rsplit("/", 1)[-1][:60]] = size
@@ -445,25 +452,51 @@ def inspect(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto
             page.wait_for_timeout(3000)
         else:
             page.wait_for_timeout(WAIT_AFTER_LOAD * 1000)
-        if wake_viewers(page):
-            page.wait_for_timeout(8000)  # give a just-started viewer time to fetch its files
-        try:
-            found = page.evaluate(DETECT_JS)
-            for fr in page.frames[1:]:
-                try:
-                    sub = fr.evaluate(DETECT_JS)
-                    found["libs"].update(sub["libs"]); found["webgl"] += sub["webgl"]; found["webgl2"] += sub["webgl2"]
-                    found["scripts"] = list(dict.fromkeys(found["scripts"] + sub["scripts"]))[:15]
-                except Exception:
-                    pass
-        except Exception:
-            found = {"candidates": [], "blocked": False, "libs": {}, "embeds": [], "webgl": 0, "webgl2": 0, "scripts": [], "title": ""}
-        try:
-            found["gpu"] = gpu_stats(page)
-        except Exception:
-            found["gpu"] = None
-        found["wasm"] = wasm
+        def analyse(pg):
+            if wake_viewers(pg):
+                pg.wait_for_timeout(8000)  # give a just-started viewer time to fetch its files
+            try:
+                f = pg.evaluate(DETECT_JS)
+                for fr in pg.frames[1:]:
+                    try:
+                        sub = fr.evaluate(DETECT_JS)
+                        f["libs"].update(sub["libs"]); f["webgl"] += sub["webgl"]; f["webgl2"] += sub["webgl2"]
+                        f["scripts"] = list(dict.fromkeys(f["scripts"] + sub["scripts"]))[:15]
+                    except Exception:
+                        pass
+            except Exception:
+                f = {"candidates": [], "blocked": False, "libs": {}, "embeds": [], "webgl": 0, "webgl2": 0,
+                     "scripts": [], "title": ""}
+            try:
+                f["gpu"] = gpu_stats(pg)
+            except Exception:
+                f["gpu"] = None
+            return f
+
+        found = analyse(page)
         k, fmt = classify(url, "")
+        # Gallery / index page with no 3D on it: open the most model-like page linked from it, in the SAME
+        # browser session (so a human check passed in assisted mode stays valid). Up to 3 tries.
+        if not fmt and not found.get("blocked") and not shows_3d(found, records):
+            same = lambda a, b: a.split("#")[0].rstrip("/") == b.split("#")[0].rstrip("/")
+            start = page.url
+            cands = [c for c in (found.get("candidates") or []) if not same(c, start)][:3]
+            for i, cand in enumerate(cands):
+                if on_status:
+                    on_status(f"No 3D on that page - it looks like a gallery. Trying a model page on the same site: {cand}"
+                              if i == 0 else f"No 3D there either. Trying another one: {cand}")
+                try:
+                    page.goto(cand, wait_until="load", timeout=60000)
+                except Exception:
+                    continue
+                page.wait_for_timeout(WAIT_AFTER_LOAD * 1000)
+                f2 = analyse(page)
+                if shows_3d(f2, records):
+                    f2["explored_from"] = start
+                    found = f2
+                    break
+        found["final_url"] = page.url
+        found["wasm"] = wasm
         found["direct_file"] = fmt if k == "model" else None   # the link itself is a 3D file, not a page
         found["browser"] = used + (" (visible, assisted)" if assisted else " (hidden)")
         shot = REPORTS / f"shot-{int(t0)}.png"
@@ -489,23 +522,13 @@ def shows_3d(found, records):
 
 
 def inspect_smart(url, assisted=False, ready=None, on_waiting=None, browser_name="Auto", on_status=None):
-    """inspect(), and if the pasted page is a gallery / index with no 3D on it, open the most
-    model-looking page linked from it on the same site and inspect that instead (up to 3 tries)."""
-    result = inspect(url, assisted, ready, on_waiting, browser_name)
-    found, records = result[0], result[1]
-    if assisted or found.get("blocked") or found.get("direct_file") or shows_3d(found, records):
-        return result + (url,)
-    same = lambda a, b: a.split("#")[0].rstrip("/") == b.split("#")[0].rstrip("/")
-    cands = [c for c in (found.get("candidates") or []) if not same(c, url)][:3]
-    for cand in cands:
-        if on_status:
-            on_status(f"No 3D on that page - it looks like a gallery. Trying a model page on the same site: {cand}"
-                      if cand == cands[0] else f"No 3D there either. Trying another one: {cand}")
-        r2 = inspect(cand, False, None, None, browser_name)
-        if shows_3d(r2[0], r2[1]):
-            r2[0]["explored_from"] = url
-            return r2 + (cand,)
-    return result + (url,)
+    """inspect() + the address of the page that was really analysed (after gallery exploring or
+    after the user browsed in assisted mode)."""
+    result = inspect(url, assisted, ready, on_waiting, browser_name, on_status)
+    final = result[0].get("final_url") or url
+    if final.startswith("https://sketchfab.com/models/") and "/embed" in final:
+        final = url           # keep the normal Sketchfab link the user pasted, not our embed address
+    return result + (final,)
 
 
 def human(n):
@@ -522,11 +545,15 @@ def gpu_active(found):
 def summary(found, records, decoders):
     lines = []
     if found.get("blocked"):
+        if "assisted" in found.get("browser", ""):
+            return ["The window was still on the 'are you human' check when the analysis started. Run it again, "
+                    "complete the check in the window that opens (tick the box / solve it until the real site shows), "
+                    "THEN press “Page is ready – analyse”. The pass is remembered in the inspector's own profile."]
         return ["This site blocked automated inspection (bot-protection / 'are you human' page), so nothing about "
-                "its 3D delivery could be seen. Open the page in your own browser and use F12 > Network instead."]
+                "its 3D delivery could be seen. Tick “I'll open it myself” (assisted mode) and pass the check yourself."]
     if found.get("explored_from"):
-        lines.append(f"The link you pasted ({found['explored_from']}) is a gallery/index page with no 3D on it, so the "
-                     "inspector opened a model page linked from it on the same site and analysed that one.")
+        lines.append(f"The page {found['explored_from']} is a gallery/index with no 3D on it, so the inspector "
+                     f"opened a model page linked from it on the same site and analysed that one: {found.get('final_url', '')}")
     if found.get("direct_file"):
         return [f"This link points straight at a 3D file ({found['direct_file']}), not at a web page. Paste the link "
                 "of the page that SHOWS the model (model page, product page, viewer) to see how a site displays and "
@@ -571,7 +598,8 @@ def summary(found, records, decoders):
     if gpu_active(found):
         api = "WebGPU" if g["webgpuDevice"] else "WebGL"
         per_frame = (f"~{g['draws_per_frame']} draw calls per frame at ~{g['fps']} fps" if g.get("frames")
-                     else "rendering runs off the main thread (worker/OffscreenCanvas), so per-frame numbers are not visible")
+                     else "no animation frames in the 2-second sample (it renders only when you interact, or off "
+                          "the main thread in a worker), so per-frame numbers are not available")
         lines.append(f"GPU catch-all ({api}): {g['buffers']} geometry/data buffers ({human(g['bufferBytes'])}) and "
                      f"{g['textures']} textures uploaded, {g['programs']} shader programs/pipelines, " + per_frame
                      + (f", {g['instanced']} instanced draws (GPU instancing)" if g["instanced"] else "") + ".")
@@ -593,7 +621,7 @@ def gpu_table(found):
             ("WebGPU", "device created" if g["webgpuDevice"] else "adapter requested only" if g["webgpu"] else "not used"),
             ("Geometry / data buffers uploaded", f"{g['buffers']:,}  ({human(g['bufferBytes'])})"),
             ("Textures uploaded", f"{g['textures']:,}"), ("Shader programs linked", f"{g['programs']:,}"),
-            ("Draw calls per frame", (f"~{g['draws_per_frame']:,}" if g.get("frames") else "n/a (renders off the main thread)")
+            ("Draw calls per frame", (f"~{g['draws_per_frame']:,}" if g.get("frames") else "n/a (no frames sampled: on-demand or worker rendering)")
              + f"  (instanced draws total: {g['instanced']:,})"),
             ("Frame rate while inspected", f"~{g['fps']} fps"),
             ("WebAssembly modules", f"{g['wasm']} instantiated · files: " + (", ".join(found.get('wasm') or {}) or "none")),
@@ -670,13 +698,13 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a != "--assisted" and not a.startswith("--browser=")]
     if len(args) != 1 or not args[0].startswith(("http://", "https://")):
         sys.exit("Usage: inspect_site.py [--assisted] [--browser=Auto|Brave|Chromium|Firefox] <http(s) link>")
-    sys.argv[1:] = args
     if assisted:
         import threading
         ev = threading.Event()
-        found, records, decoders, apis, shot, secs = inspect(
-            args[0], assisted=True, ready=ev, browser_name=bname,
+        found, records, decoders, apis, shot, secs, used_url = inspect_smart(
+            args[0], assisted=True, ready=ev, browser_name=bname, on_status=print,
             on_waiting=lambda: (input("Browse / pass any check in the window, then press Enter here... "), ev.set()))
+        args[0] = used_url
     else:
         found, records, decoders, apis, shot, secs, used_url = inspect_smart(args[0], browser_name=bname, on_status=print)
         args[0] = used_url
@@ -685,7 +713,7 @@ if __name__ == "__main__":
     extra = None
     try:
         import sketchfab
-        extra = sketchfab.facts(sys.argv[1])
+        extra = sketchfab.facts(args[0])
         for sec, rows in extra or []:
             for k, v in rows:
                 if k == "Textures" and str(v).replace(",", "").isdigit():
